@@ -25,9 +25,9 @@ from abc import abstractmethod
 from . import backbones
 from .loss_aggregator import LossAggregator
 from data.transform import get_transform
-from data.collate_fn import CollateFn
 from data.dataset import DataSet
 import data.sampler as Samplers
+import data.collate_fn as CollateFns
 from utils import Odict, mkdir, ddp_all_gather
 from utils import get_valid_args, is_list, is_dict, np2var, ts2np, list2var, get_attr_from
 from evaluation import evaluator as eval_functions
@@ -211,10 +211,13 @@ class BaseModel(MetaModel, nn.Module):
             'sample_type', 'type'])
         sampler = Sampler(dataset, **vaild_args)
 
+        CollateFn = get_attr_from([CollateFns], sampler_cfg['collatefn_type']) if 'collatefn_type' in sampler_cfg else CollateFns.CollateFn
+        collate_fn = CollateFn(dataset.label_set, sampler_cfg)
+
         loader = tordata.DataLoader(
             dataset=dataset,
             batch_sampler=sampler,
-            collate_fn=CollateFn(dataset.label_set, sampler_cfg),
+            collate_fn=collate_fn,
             num_workers=data_cfg['num_workers'])
         return loader
 
