@@ -12,7 +12,7 @@ evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: true
   restore_hint: 6000
-  save_name: GaitBase_TCLBase_nolinear_sgd
+  save_name: GaitBase_TCLBase_sgd_unfix
   eval_func: evaluate_CCPG
   sampler:
     batch_shuffle: false
@@ -68,27 +68,29 @@ model_cfg:
     - 16
   cluster_cfg:
     in_channels: 512
-    num_parts: 16
-    num_clusters: 8
+    # num_parts: 16
+    num_clusters: 6
     # hidden_dim: 128
-    similarity: euclidean
-
-optimizer_cfg:
-  lr: 0.0001
-  momentum: 0.9
-  solver: Adam
-  weight_decay: 0.0005
+    similarity: cosine # cosine, euclidean
 
 # optimizer_cfg:
-#   lr: 0.1
+#   lr: 0.0001
 #   momentum: 0.9
-#   solver: SGD
+#   solver: Adam
 #   weight_decay: 0.0005
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
 
 scheduler_cfg:
   gamma: 0.1
   milestones: # Learning Rate Reduction at each milestones
-    - 5000
+    - 4000
+    - 6000
+    - 8000
   scheduler: MultiStepLR
 trainer_cfg:
   enable_float16: true # half_percesion float for memory reduction and speedup
@@ -97,10 +99,10 @@ trainer_cfg:
   log_iter: 100
   restore_ckpt_strict: true
   restore_hint: 0
-  save_iter: 2000
-  save_name: GaitBase_TCLBase_nolinear_sgd
+  save_iter: 4500
+  save_name: GaitBase_TCLBase_sgd_unfix
   sync_BN: true
-  total_iter: 6000
+  total_iter: 9000
   sampler:
     batch_shuffle: true
     batch_size:
@@ -109,8 +111,11 @@ trainer_cfg:
     type: TripletSampler
     collatefn_type: CollateFnTCL
     frames_num_ordered: 100
-    frames_num_random: 30
+    # frames_num_random: 30
+    sample_random_range: [10, 50]
     frames_ordered_skip: 0
+    ordered: False
+
   transform:
     - type: BaseSilCuttingTransform
       img_w: 64

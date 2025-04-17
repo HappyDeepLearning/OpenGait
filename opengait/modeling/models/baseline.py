@@ -60,7 +60,7 @@ class Baseline_TCL(BaseModel):
         self.Backbone = SetBlockWrapper(self.Backbone)
         self.FCs = SeparateFCs(**model_cfg['SeparateFCs'])
         self.BNNecks = SeparateBNNecks(**model_cfg['SeparateBNNecks'])
-        self.HPP = SetBlockWrapper(HorizontalPoolingPyramid(bin_num=model_cfg['bin_num']))
+        self.HPP = HorizontalPoolingPyramid(bin_num=model_cfg['bin_num'])
         self.gm_adapter = PhaseClusterAdapter(**model_cfg['cluster_cfg'])
         self.pretrain_weights_path = model_cfg['pretrain_weights_path']
 
@@ -96,12 +96,12 @@ class Baseline_TCL(BaseModel):
         del ipts
         outs = self.Backbone(sils)  # [n, c, s, h, w]
 
+        outs, cluster_indices = self.gm_adapter(outs, training=self.training)  # [n, c, h, w], [n, s]
+
         # Horizontal Pooling Matching, HPM
-        feat = self.HPP(outs)  # [n, c, s, p]
+        feat = self.HPP(outs)  # [n, c, p]
 
-        outs, cluster_indices = self.gm_adapter(feat, training=self.training)  # [n, c, p], [n, s]
-
-        embed_1 = self.FCs(outs)  # [n, c, p]
+        embed_1 = self.FCs(feat)  # [n, c, p]
         embed_2, logits = self.BNNecks(embed_1)  # [n, c, p]
         embed = embed_1
 
@@ -133,8 +133,8 @@ class Baseline_TCL(BaseModel):
             'training_feat': {
                 'triplet': {'embeddings': embed_1, 'labels': labs},
                 'softmax': {'logits': logits, 'labels': labs},
-                'cluster_loss': cluster_loss,
-                'balance_loss': balance_loss 
+                'cluster_loss': cluster_loss * 10,
+                'balance_loss': balance_loss * 10
             },
             'visual_summary': clustered_frames,
             'inference_feat': {

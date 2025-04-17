@@ -1,113 +1,236 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+class PhaseClusterAdapter(nn.Module):
+    """
+    Spatial PhaseClusterAdapter with 2D conv output projection:
+      - Input x: [batch, channels, seq_len, height, width]
+      - Outputs:
+          out: [batch, channels, height, width]
+          cluster_indices: [batch, seq_len]
+    """
+    def __init__(self,
+                 in_channels: int,
+                 num_clusters: int = 4,
+                 similarity: str = 'cosine',
+                 hight=16,
+                 width=11):
+        super().__init__()
+        self.C = in_channels
+        self.num_clusters = num_clusters
+        self.similarity = similarity.lower()
+        # cluster_prototypes will be initialized lazily in forward()
+        p = hight * width  # number of spatial parts
+        self.cluster_prototypes = nn.Parameter(
+            torch.randn(p, self.num_clusters, self.C)
+        )
+
+        # output projector: 1×1 2D convs over the (K·C) feature map
+        self.out_projector = nn.Sequential(
+            nn.Conv2d(self.num_clusters * self.C, self.C, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.C),
+            nn.GELU(),
+            nn.Conv2d(self.C, self.C, kernel_size=1),
+        )
+        # learnable temperature for softmax
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+
+    def _init_weights(self):
+        pass
+
+    def forward(self, x: torch.Tensor, training: bool = True):
+        """
+        Args:
+          x: input features of shape [n, C, S, H, W]
+          training: whether to apply Straight‑Through Estimator on hard assignment
+
+        Returns:
+          out: aggregated features [n, C, H, W]
+          cluster_indices: hard cluster label per frame [n, S]
+        """
+        n, c, s, h, w = x.shape
+        assert c == self.C, f"Expected input channels {self.C}, got {c}"
+        p = h * w  # number of spatial parts
+
+        # 1) flatten spatial dims into a single "parts" dimension
+        x_flat = x.view(n, c, s, p)                       # [n, C, S, P]
+        x_flat = rearrange(x_flat, 'n C S P -> P n S C')  # [P, n, S, C]
+
+        # 2) compute similarity between each part's feature and its K prototypes
+        if self.similarity == 'cosine':
+            x_norm = F.normalize(x_flat, dim=-1)                  # [P,n,S,C]
+            proto_norm = F.normalize(self.cluster_prototypes, dim=-1)  # [P,K,C]
+            sim = torch.einsum('pnsc,pkc->pnsk', x_norm, proto_norm)   # [P,n,S,K]
+        else:  # euclidean distance
+            x_e = x_flat.unsqueeze(2)                              # [P,n,1,S,C]
+            p_e = self.cluster_prototypes.unsqueeze(1).unsqueeze(3)  # [P,1,K,1,C]
+            dist2 = ((x_e - p_e)**2).sum(-1)                        # [P,n,K,S]
+            sim = -dist2.permute(0,1,3,2).contiguous()             # [P,n,S,K]
+
+        # 3) compute soft assignments via temperature‑scaled softmax
+        soft = F.softmax(sim / self.temperature, dim=-1)           # [P,n,S,K]
+        self.soft_assignment = soft  
+        # optionally apply STE for hard assignment
+        if training:
+            with torch.no_grad():
+                idx = soft.argmax(dim=-1, keepdim=True)           # [P,n,S,1]
+                one_hot = torch.zeros_like(soft).scatter_(-1, idx, 1.0)
+            assign = (one_hot - soft).detach() + soft              # STE
+        else:
+            idx = sim.argmax(dim=-1, keepdim=True)
+            assign = torch.zeros_like(sim).scatter_(-1, idx, 1.0)
+
+        # 4) derive a single cluster index per frame by averaging across parts
+        avg_soft = soft.mean(dim=0)        # [n,S,K]
+        cluster_indices = avg_soft.argmax(dim=-1)  # [n,S]
+
+        # 5) aggregate features per cluster by max‑pooling over the time dimension
+        a = rearrange(assign, 'P n S K -> P n K S').unsqueeze(-1)  # [P,n,K,S,1]
+        x_e = x_flat.unsqueeze(2)                                  # [P,n,1,S,C]
+        clustered = (a * x_e).max(dim=3)[0]                        # [P,n,K,C]
+        # reshape into [n, K*C, H, W]
+        clustered = rearrange(clustered, 'P n K C -> n (K C) P')
+        clustered = clustered.view(n, self.num_clusters * self.C, h, w)      # [n, K·C, H, W]
+
+        # 6) project concatenated cluster features back to C channels via 2D conv
+        out = self.out_projector(clustered)                        # [n, C, H, W]
+
+        return out, cluster_indices
+
+    def diversity_loss(self) -> torch.Tensor:
+        """
+        Encourage prototypes within each part to be distinct.
+        - Cosine mode: minimize squared off-diagonal correlations.
+        - Euclidean mode: maximize pairwise distances.
+        Returns average diversity loss over all parts.
+        """
+        # self.cluster_prototypes: [P, K, C]
+        P, K, C = self.cluster_prototypes.shape
+        proto = self.cluster_prototypes  # [P,K,C]
+
+        if self.similarity == 'cosine':
+            # normalize each prototype vector
+            proto_n = F.normalize(proto, dim=-1)  # [P,K,C]
+            # compute K×K similarity matrix per part
+            sim_mat = torch.einsum('pkc,pjc->pkj', proto_n, proto_n)  # [P,K,K]
+            # zero out diagonal
+            eye = torch.eye(K, device=sim_mat.device).unsqueeze(0)    # [1,K,K]
+            loss = ((sim_mat - eye)**2).sum(dim=(1,2)) / (K*(K-1))    # [P]
+        else:
+            # pairwise distances per part
+            # flatten parts × clusters for cdist
+            flat = proto.view(P * K, C)
+            dist = torch.cdist(flat, flat, p=2).view(P, K, P, K)
+            # we only care distances within same part: diagonal over the P dimension
+            dist_pp = torch.stack([dist[i, :, i, :] for i in range(P)], dim=0)  # [P,K,K]
+            # zero diagonal
+            mask = ~torch.eye(K, device=dist_pp.device, dtype=torch.bool)
+            dist_sq = dist_pp.pow(2)
+            loss = dist_sq.masked_select(mask).view(P, -1).mean(dim=1)  # [P]
+
+        # average over parts
+        return loss.mean()
+
+    def balance_loss(self) -> torch.Tensor:
+        """
+        Encourage clusters to be equally used across batch, frames, and parts.
+        Compute KL(avg_soft || uniform).
+        """
+        # self.soft_assignment: [P, n, S, K]
+        if self.soft_assignment is None:
+            raise RuntimeError("soft_assignment not computed in forward")
+        avg_prob = self.soft_assignment.mean(dim=(0,1,2))  # [K]
+        uni = torch.full_like(avg_prob, 1.0 / self.num_clusters)
+        # kl_div expects input = log-probs
+        return F.kl_div(avg_prob.log(), uni, reduction='batchmean')
+
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
 # from einops import rearrange
+# # from ...modules import SeparateFCs  # 请根据实际路径修改导入
 
 # class PhaseClusterAdapter(nn.Module):
-#     """
-#     PhaseClusterAdapter, but clustering on the flattened (c, p) space:
-#       - x: [batch, c, seq_len, parts]
-#       - merge c & parts → D = c * parts
-#       - cluster prototypes: [K, D]
-#       - output: [batch, c, parts] + cluster_indices [batch, seq_len]
-#     """
-#     def __init__(
-#         self,
-#         in_channels: int,
-#         hidden_dim: int,
-#         num_parts: int,
-#         num_clusters: int = 4,
-#         similarity: str = 'cosine'
-#     ):
+#     def __init__(self, in_channels, num_parts, num_clusters=4, num_heads=4, similarity='cosine'):
 #         super().__init__()
-#         self.in_channels  = in_channels
-#         self.num_parts    = num_parts
+#         self.in_channels = in_channels
+#         self.num_parts = num_parts
 #         self.num_clusters = num_clusters
-#         self.similarity   = similarity
-#         self.hidden_dim   = hidden_dim
+#         self.similarity = similarity  # 'euclidean' or 'cosine'
 
-#         self.in_projector = nn.Sequential(
-#             nn.Conv1d(in_channels, hidden_dim, kernel_size=1, bias=False),
-#             nn.BatchNorm1d(hidden_dim),
-#             nn.GELU(),
-#             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-#         )
-
-#         # clustering in the flattened (c * p) space
-#         D = hidden_dim * num_parts
-#         self.cluster_prototypes = nn.Parameter(torch.randn(num_clusters, D))
-#         self._init_weights()
-
-#         # project K * c → c for each part (length = p)
+#         self.cluster_prototypes = nn.Parameter(torch.randn(num_parts, num_clusters, in_channels))
+#         # self.linear = SeparateFCs(parts_num=num_parts,
+#         #                           in_channels=in_channels * num_clusters,
+#         #                           out_channels=in_channels)
 #         self.out_projector = nn.Sequential(
-#             nn.Conv1d(hidden_dim * num_clusters, in_channels, kernel_size=1, bias=False),
+#             nn.Conv1d(in_channels * num_clusters, out_channels=in_channels, kernel_size=1),
 #             nn.BatchNorm1d(in_channels),
 #             nn.GELU(),
-#             nn.Conv1d(in_channels, in_channels, kernel_size=1, bias=False),
+#             nn.Conv1d(in_channels, out_channels=in_channels, kernel_size=1),
 #         )
-
-#         # start with a softer temperature
-#         self.temperature = nn.Parameter(torch.tensor(1.0))
+#         self.temperature = nn.Parameter(torch.tensor(0.07))  # learnable temperature
 
 #     def _init_weights(self):
+#         # pass
 #         nn.init.orthogonal_(self.cluster_prototypes)
 
-#     def forward(self, x: torch.Tensor):
+#     def forward(self, x, training=True):
 #         """
 #         Args:
-#           x: [B, C, S, P]
+#             x: Tensor of shape [n, c, s, p]
+#             training: whether to use STE soft assignment
 #         Returns:
-#           out:              [B, C, P]
-#           cluster_indices:  [B, S]
+#             out: [n, c, p]  - output features per part
+#             cluster_indices: [n, s] - one cluster label per frame
 #         """
-#         B, C_in, S, P = x.shape
+#         n, c, s, p = x.shape
 
-#         # 1) project to hidden dim
-#         x = rearrange(x, 'b c s p -> (b p) c s').contiguous()  # [B*P, C_in, S]
-#         x = self.in_projector(x)                # [B*P, C_h, S]
-#         x = rearrange(x, '(b p) d s -> b d s p', b=B, p=P).contiguous()  # [B, C_h, S, P]
-#         C_h = x.shape[1]
-#         D = C_h * P
+#         # compute similarity
+#         x = rearrange(x, 'n c s p -> p n s c').contiguous()  # [p, n, s, c]
 
-#         # 1) flatten channel & part dims → [B, S, D]
-#         x_flat = rearrange(x, 'b c s p -> b s (c p)').contiguous()
-
-#         # 2) compute similarity [B, S, K]
 #         if self.similarity == 'cosine':
-#             x_norm   = F.normalize(x_flat, dim=-1)               # [B, S, D]
-#             proto_nm = F.normalize(self.cluster_prototypes, dim=-1)  # [K, D]
-#             sim = torch.einsum('bsd,kd->bsk', x_norm, proto_nm)
+#             x_normed = F.normalize(x, dim=-1)
+#             proto_normed = F.normalize(self.cluster_prototypes, dim=-1)
+#             sim = torch.einsum('pnsc,pkc->pnsk', x_normed, proto_normed)  # [p, n, s, K]
+#         else:  # euclidean
+#             x_exp = x.unsqueeze(2)  # [p, n, 1, s, c]
+#             proto_exp = self.cluster_prototypes.unsqueeze(1).unsqueeze(3)  # [p, 1, K, 1, c]
+#             dist_squared = ((x_exp - proto_exp) ** 2).sum(-1)  # [p, n, K, s]
+#             sim = -dist_squared.permute(0, 1, 3, 2).contiguous()  # [p, n, s, K]
+
+#         # Soft assignment (STE if training)
+#         soft_assignment = F.softmax(sim / self.temperature, dim=-1)  # [p, n, s, K]
+
+#         if training:
+#             with torch.no_grad():
+#                 hard_idx = soft_assignment.argmax(dim=-1, keepdim=True)
+#                 hard_assignment = torch.zeros_like(soft_assignment).scatter_(-1, hard_idx, 1.0)
+#             assignment = (hard_assignment - soft_assignment).detach() + soft_assignment  # STE
 #         else:
-#             x_exp   = x_flat.unsqueeze(2)                         # [B, S, 1, D]
-#             proto_exp = self.cluster_prototypes.unsqueeze(0)      # [1, K, D]
-#             dist = ((x_exp - proto_exp) ** 2).sum(-1)             # [B, S, K]
-#             sim  = -dist
+#             hard_idx = sim.argmax(dim=-1, keepdim=True)
+#             assignment = torch.zeros_like(sim).scatter_(-1, hard_idx, 1.0)
 
-#         # 3) soft assignment (with STE during training)
-#         soft = F.softmax(sim / self.temperature, dim=-1)         # [B, S, K]
-#         with torch.no_grad():
-#             hard_idx       = soft.argmax(dim=-1, keepdim=True)       # [B, S, 1]
-#             hard_assign    = torch.zeros_like(soft).scatter_(-1, hard_idx, 1.0)
-#         assignment = (hard_assign - soft).detach() + soft
+#         self.soft_assignment = soft_assignment  # for inspection/visualization
 
-#         self.soft_assignment = soft                               # save for losses / viz
-#         cluster_indices      = soft.argmax(dim=-1)                # [B, S]
+#         # Soft assignment 平均 + argmax -> [n, s]
+#         cluster_indices = soft_assignment.mean(dim=0).argmax(dim=-1)  # [n, s]
 
-#         # 4) compute cluster-wise pooled features: [B, K, D]
-#         #    cluster_feats[b,k] = sum_{t=1..S} assignment[b,t,k] * x_flat[b,t]
-#         cluster_feats = torch.einsum('bsk,bsd->bkd', assignment, x_flat)
+#         # 聚类结果重新组织为 [p, n, K, s, 1]
+#         assignment = rearrange(assignment, 'p n s k -> p n k s').unsqueeze(-1)  # [p, n, K, s, 1]
+#         x_expanded = x.unsqueeze(2)  # [p, n, 1, s, c]
+#         clustered = assignment * x_expanded  # [p, n, K, s, c]
 
-#         # 5) reshape to [B, K*C, P]
-#         clustered = rearrange(
-#             cluster_feats,
-#             'b k (c p) -> b (k c) p',
-#             c=C_h, p=P
-#         )
+#         # temporal pooling per cluster
+#         clustered = clustered.max(dim=-2)[0]  # [p, n, K, c]
+#         clustered = rearrange(clustered, 'p n k c -> n (k c) p')  # [n, K*c, p]
 
-#         # 6) project back to [B, C, P]
-#         out = self.out_projector(clustered)
+#         # project to final feature
+#         out = self.out_projector(clustered)  # [n, c, p]
 
 #         return out, cluster_indices
+
 
 #     def diversity_loss(self):
 #         """
@@ -142,125 +265,6 @@
 #         return F.kl_div(avg_prob.log(), uni, reduction='batchmean')
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-# from ...modules import SeparateFCs  # 请根据实际路径修改导入
-
-class PhaseClusterAdapter(nn.Module):
-    def __init__(self, in_channels, num_parts, num_clusters=4, num_heads=4, similarity='cosine'):
-        super().__init__()
-        self.in_channels = in_channels
-        self.num_parts = num_parts
-        self.num_clusters = num_clusters
-        self.similarity = similarity  # 'euclidean' or 'cosine'
-
-        self.cluster_prototypes = nn.Parameter(torch.randn(num_parts, num_clusters, in_channels))
-        # self.linear = SeparateFCs(parts_num=num_parts,
-        #                           in_channels=in_channels * num_clusters,
-        #                           out_channels=in_channels)
-        self.out_projector = nn.Sequential(
-            nn.Conv1d(in_channels * num_clusters, out_channels=in_channels, kernel_size=1),
-            nn.BatchNorm1d(in_channels),
-            nn.GELU(),
-            nn.Conv1d(in_channels, out_channels=in_channels, kernel_size=1),
-        )
-        self.temperature = nn.Parameter(torch.tensor(0.07))  # learnable temperature
-
-    def _init_weights(self):
-        # pass
-        nn.init.orthogonal_(self.cluster_prototypes)
-
-    def forward(self, x, training=True):
-        """
-        Args:
-            x: Tensor of shape [n, c, s, p]
-            training: whether to use STE soft assignment
-        Returns:
-            out: [n, c, p]  - output features per part
-            cluster_indices: [n, s] - one cluster label per frame
-        """
-        n, c, s, p = x.shape
-
-        # compute similarity
-        x = rearrange(x, 'n c s p -> p n s c').contiguous()  # [p, n, s, c]
-
-        if self.similarity == 'cosine':
-            x_normed = F.normalize(x, dim=-1)
-            proto_normed = F.normalize(self.cluster_prototypes, dim=-1)
-            sim = torch.einsum('pnsc,pkc->pnsk', x_normed, proto_normed)  # [p, n, s, K]
-        else:  # euclidean
-            x_exp = x.unsqueeze(2)  # [p, n, 1, s, c]
-            proto_exp = self.cluster_prototypes.unsqueeze(1).unsqueeze(3)  # [p, 1, K, 1, c]
-            dist_squared = ((x_exp - proto_exp) ** 2).sum(-1)  # [p, n, K, s]
-            sim = -dist_squared.permute(0, 1, 3, 2).contiguous()  # [p, n, s, K]
-
-        # Soft assignment (STE if training)
-        soft_assignment = F.softmax(sim / self.temperature, dim=-1)  # [p, n, s, K]
-
-        if training:
-            with torch.no_grad():
-                hard_idx = soft_assignment.argmax(dim=-1, keepdim=True)
-                hard_assignment = torch.zeros_like(soft_assignment).scatter_(-1, hard_idx, 1.0)
-            assignment = (hard_assignment - soft_assignment).detach() + soft_assignment  # STE
-        else:
-            hard_idx = sim.argmax(dim=-1, keepdim=True)
-            assignment = torch.zeros_like(sim).scatter_(-1, hard_idx, 1.0)
-
-        self.soft_assignment = soft_assignment  # for inspection/visualization
-
-        # Soft assignment 平均 + argmax -> [n, s]
-        cluster_indices = soft_assignment.mean(dim=0).argmax(dim=-1)  # [n, s]
-
-        # 聚类结果重新组织为 [p, n, K, s, 1]
-        assignment = rearrange(assignment, 'p n s k -> p n k s').unsqueeze(-1)  # [p, n, K, s, 1]
-        x_expanded = x.unsqueeze(2)  # [p, n, 1, s, c]
-        clustered = assignment * x_expanded  # [p, n, K, s, c]
-
-        # temporal pooling per cluster
-        clustered = clustered.max(dim=-2)[0]  # [p, n, K, c]
-        clustered = rearrange(clustered, 'p n k c -> n (k c) p')  # [n, K*c, p]
-
-        # project to final feature
-        out = self.out_projector(clustered)  # [n, c, p]
-
-        return out, cluster_indices
-
-
-    def diversity_loss(self):
-        """
-        Diversity loss, switchable by self.similarity:
-          - 'euclidean': mean_{i≠j} ||p_i - p_j||^2
-          - 'cosine'   : mean_{i≠j} (⟨p_i,p_j⟩)²  after L2 normalization
-        """
-        K = self.num_clusters
-        prototypes = self.cluster_prototypes  # [K, D]
-
-        if self.similarity == 'cosine':
-            # Cosine: encourage orthogonality
-            proto_norm = F.normalize(prototypes, dim=-1)     # [K, D]
-            sim_mat    = torch.matmul(proto_norm, proto_norm.t())  # [K, K]
-            I          = torch.eye(K, device=sim_mat.device)
-            # (sim - I)^2 zeroes out diagonal, penalizes off-diagonals
-            return (sim_mat - I).pow(2).mean()
-        else:  # 'euclidean'
-            # Euclidean: pairwise squared distance
-            dist = torch.cdist(prototypes, prototypes, p=2)  # [K, K]
-            dist_sq = dist.pow(2)
-            mask = ~torch.eye(K, device=dist_sq.device, dtype=torch.bool)
-            return dist_sq.masked_select(mask).mean()
-
-    def balance_loss(self):
-        """
-        Encourage clusters to be equally used:
-        KL( avg_soft || uniform )
-        """
-        avg_prob = self.soft_assignment.mean(dim=(0, 1))      # [K]
-        uni      = torch.full_like(avg_prob, 1.0/self.num_clusters)
-        return F.kl_div(avg_prob.log(), uni, reduction='batchmean')
-
-
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
@@ -272,7 +276,7 @@ class PhaseClusterAdapter(nn.Module):
 #         self.c = in_channels
 #         self.p = num_parts
 #         self.num_clusters = num_clusters
-#         self.kmeans_iters = kmeans_iters
+#         self.num_clustersmeans_iters = kmeans_iters
 #         self.out_projecter = nn.Conv1d(in_channels * num_clusters, in_channels, 1, bias=False)
 
 #     @torch.no_grad()
@@ -290,7 +294,7 @@ class PhaseClusterAdapter(nn.Module):
 #         rand_idx = torch.randint(0, s, (b, self.num_clusters), device=x.device)
 #         centroids = torch.gather(x_reshaped, 1, rand_idx.unsqueeze(-1).expand(-1, -1, c))  # [b, K, c]
 
-#         for _ in range(self.kmeans_iters):
+#         for _ in range(self.num_clustersmeans_iters):
 #             # 欧氏距离展开式：||x - c||^2 = ||x||^2 + ||c||^2 - 2xTc
 #             x_sq = (x_reshaped ** 2).sum(dim=-1, keepdim=True)  # [b, s, 1]
 #             c_sq = (centroids ** 2).sum(dim=-1).unsqueeze(1)    # [b, 1, K]
