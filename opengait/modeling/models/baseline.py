@@ -105,8 +105,8 @@ class Baseline_TCL(BaseModel):
         embed_2, logits = self.BNNecks(embed_1)  # [n, c, p]
         embed = embed_1
 
-        # cluster loss
         cluster_loss = self.gm_adapter.diversity_loss()
+        balance_loss = self.gm_adapter.balance_loss()
         
         # vis
         clustered_frames = {}
@@ -134,6 +134,7 @@ class Baseline_TCL(BaseModel):
                 'triplet': {'embeddings': embed_1, 'labels': labs},
                 'softmax': {'logits': logits, 'labels': labs},
                 'cluster_loss': cluster_loss,
+                'balance_loss': balance_loss 
             },
             'visual_summary': clustered_frames,
             'inference_feat': {

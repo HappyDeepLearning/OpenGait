@@ -1,6 +1,7 @@
 # # **************** For CASIA-B ****************
 # # Baseline
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/baseline/baseline.yaml --phase train
+CUDA_VISIBLE_DEVICES=1,2,3,4 python -m torch.distributed.launch --nproc_per_node=4 \
+opengait/main.py --cfgs ./configs/gaitbasetcl/gaitbasetcl_ccpg.yaml --phase train --log_to_file
 
 # # GaitSet
 # CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/gaitset/gaitset.yaml --phase train
