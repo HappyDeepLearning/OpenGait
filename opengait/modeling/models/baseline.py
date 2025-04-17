@@ -99,7 +99,7 @@ class Baseline_TCL(BaseModel):
         # Horizontal Pooling Matching, HPM
         feat = self.HPP(outs)  # [n, c, s, p]
 
-        outs, cluster_indices = self.gm_adapter(feat)  # [n, c, p], [n, s]
+        outs, cluster_indices = self.gm_adapter(feat, training=self.training)  # [n, c, p], [n, s]
 
         embed_1 = self.FCs(outs)  # [n, c, p]
         embed_2, logits = self.BNNecks(embed_1)  # [n, c, p]

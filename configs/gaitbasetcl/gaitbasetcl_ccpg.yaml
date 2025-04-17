@@ -70,7 +70,7 @@ model_cfg:
     in_channels: 512
     num_parts: 16
     num_clusters: 8
-    hidden_dim: 128
+    # hidden_dim: 128
     similarity: euclidean
 
 optimizer_cfg:
@@ -109,7 +109,7 @@ trainer_cfg:
     type: TripletSampler
     collatefn_type: CollateFnTCL
     frames_num_ordered: 100
-    frames_num_random: 32
+    frames_num_random: 30
     frames_ordered_skip: 0
   transform:
     - type: BaseSilCuttingTransform
